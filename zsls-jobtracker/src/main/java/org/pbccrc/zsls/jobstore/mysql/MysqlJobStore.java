@@ -1,6 +1,7 @@
 package org.pbccrc.zsls.jobstore.mysql;
 
 import java.sql.SQLException;
+import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.List;
 
@@ -14,6 +15,7 @@ import org.pbccrc.zsls.store.jdbc.Transaction;
 import org.pbccrc.zsls.store.jdbc.TransactionFactory;
 import org.pbccrc.zsls.store.jdbc.builder.DropTableSql;
 import org.pbccrc.zsls.store.jdbc.builder.InsertSql;
+import org.pbccrc.zsls.store.jdbc.builder.OrderByType;
 import org.pbccrc.zsls.store.jdbc.builder.SelectSql;
 import org.pbccrc.zsls.tasks.rt.RTJobFlow;
 import org.pbccrc.zsls.tasks.rt.RTJobId;
@@ -128,6 +130,38 @@ public class MysqlJobStore extends JdbcJobStore {
 		.dropIfExist(table)
 		.inTransaction(trans)
 		.doDrop();
+	}
+
+	@Override
+	protected SelectSql limitResultSet(String sql, int start, int end) {
+		SelectSql sql_limit = new SelectSql(getSqlTemplate())
+				.select()
+				.all()
+				.from()
+				.table(" ( " + sql + " ) t ")
+				.limit(start, end);
+		return sql_limit;
+	}
+
+	@Override
+	public List<RTJobFlow> fetchUnitsByDate(String domain, Date date, int start, int end) {
+		SelectSql sql = new SelectSql(getSqlTemplate())
+				.select()
+				.all()
+				.from()
+				.table(getUnitTable(domain));
+				
+	sql = date != null ? sqlSelectWhereDateMatch(sql, date) : sql;
+	sql.orderBy().column(COL_UNIT_ID, OrderByType.DESC);
+	SimpleDateFormat sd = new SimpleDateFormat("YYYY-MM-dd");
+	
+	String _sql = sql.getSQL();
+	if (_sql.contains("?"))
+		_sql = _sql.replaceFirst("\\?", "'" + sd.format(date) + "'");
+	sql = limitResultSet(_sql, start, end);
+	List<RTJobFlow> uList = sql.list(new BatchUnitHandler());
+	
+	return uList;
 	}
 
 }

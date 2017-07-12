@@ -42,6 +42,7 @@ import org.pbccrc.zsls.sched.NodePicker;
 import org.pbccrc.zsls.sched.NodePickerFactory;
 import org.pbccrc.zsls.sched.rt.RTJobEngine;
 import org.pbccrc.zsls.service.AbstractService;
+import org.pbccrc.zsls.tasks.MissedTaskCollector.TaskAssignInfo;
 import org.pbccrc.zsls.tasks.dt.QuartzTaskInfo;
 import org.pbccrc.zsls.tasks.dt.QuartzTaskManager;
 import org.pbccrc.zsls.tasks.dt.ServerQuartzJob;
@@ -71,6 +72,8 @@ public class TaskProcessor extends AbstractService implements EventHandler<TaskE
 	private NodePicker nodePicker;
 	private UnitMarker unitMarker;
 	
+	private MissedTaskCollector collector;
+	
 	private int maxCache;
 	private int threshold;
 	
@@ -96,6 +99,8 @@ public class TaskProcessor extends AbstractService implements EventHandler<TaskE
 		// unit marker
 		unitMarker = new UnitMarker(context);
 		unitMarker.serviceInit(config);
+		// missed task collector
+		collector = new MissedTaskCollector(context);
 		
 		super.serviceInit(config);
 	}
@@ -125,7 +130,7 @@ public class TaskProcessor extends AbstractService implements EventHandler<TaskE
 		if (client == null) {
 			client = ZuesRPC.getRpcClient(TaskHandleProtocol.Iface.class, 
 					new InetSocketAddress(id.ip, id.port));
-			//assignClients.put(id, client);
+			assignClients.put(id, client);
 		}
 		return client;
 	}
@@ -156,6 +161,28 @@ public class TaskProcessor extends AbstractService implements EventHandler<TaskE
 			return rtJobEngines.get(domain);
 	}
 	
+	private boolean checkRunningTasks(String domain, DomainType dtype, JobEngine engine, 
+			WorkNode node, List<TTaskId> tasks) {
+		List<TaskAssignInfo> missedTasks = collector.checkRunningTask(domain, node, tasks);
+		if (missedTasks.size() <= 0)
+			return false;
+		if (missedTasks.size() > 0) {
+			L.warn(domain, "collect " + missedTasks.size() + " tasks");
+			JobManager manager = LocalJobManager.getJobManager(domain, dtype);
+			for (TaskAssignInfo info : missedTasks) {
+				L.warn(domain, "collect untracked task " + info.taskId + " back from node " + info.node.getNodeId());
+				node.removeTask(new TaskId(info.taskId));
+				Task task = manager.getTask(info.taskId);
+				if (task != null) {
+					context.getTimeoutManager().cancelTimeout(task);
+					task.markStatus(TaskStat.Init);
+					if (engine != null)
+						engine.addToExecutableQueue(task);
+				}
+			}
+		}
+		return true;
+	}
 
 	@Override
 	public void handle(TaskEvent event) {
@@ -163,25 +190,35 @@ public class TaskProcessor extends AbstractService implements EventHandler<TaskE
 		DomainType dtype = event.getDomainType();
 		DomainManager dmanager = context.getDomainManager();
 		switch (event.getType()) {
+		case UPDATE_RUNNING:
+			WorkNode node = context.getNodeManager().getNode(domain, event.getNode().getNodeId());
+			JobEngine engine = dtype == DomainType.RT ? rtJobEngines.get(domain) : dtJobEngine;
+			boolean hasMissedTask = checkRunningTasks(domain, dtype, engine, node, event.getTasks());
+			if (hasMissedTask && dmanager.getDomainStatus(domain) == DomainStatus.Running) {
+				tryAssignTask(engine);
+			}
+			break;
 		case COMPLETE:
 		case FAIL:
 			TaskResult tr = event.getResult();
 			NodeId id = tr.getNodeId();
 			TaskId task = tr.getTaskId();
-			WorkNode node = context.getNodeManager().getNode(domain, id);
+			node = context.getNodeManager().getNode(domain, id);
+			if (!id.isFake() && node == null) {
+				L.error(domain, "completed task " + task + " from unregistered node: " + id);
+				return;
+			}
 			
-			if (!id.isFake()) {
-				if (node == null) {
-					L.error(domain, "completed task " + task + " from unregistered node: " + id);
-					return;
-				}
-				else if (!node.removeTask(task))
+			if (L.logger().isDebugEnabled())
+				L.debug(domain, "task " + task + " completed from node " + id);
+			
+			engine = dtype == DomainType.RT ? rtJobEngines.get(domain) : dtJobEngine;
+			if (!id.isFake() && node != null) {
+				checkRunningTasks(domain, dtype, engine, node, event.getTasks());
+				if (!node.removeTask(task))
 					L.error(domain, "completed task " + task + " not registered in node: " + id);
 			}
-			if (L.logger().isDebugEnabled())
-				L.debug(domain, "task " + task + " success from node " + id);
 			
-			JobEngine engine = dtype == DomainType.RT ? rtJobEngines.get(domain) : dtJobEngine;
 			if (engine == null) break;
 			
 			JobFlow u = engine.complete(task, tr);
@@ -202,19 +239,10 @@ public class TaskProcessor extends AbstractService implements EventHandler<TaskE
 				}
 			}
 			
-			if (node != null)
-				node.removeTask(task);
-			
 			// only can assign tasks after the loading of runtime info from all
 			// nodes completed.
-			if (dmanager.getDomainStatus(domain) == DomainStatus.Running) {
+			if (dmanager.getDomainStatus(domain) == DomainStatus.Running)
 				tryAssignTask(engine);
-			}
-			
-			// user mark task as complete by force
-			if (id.isFake()) {
-				Replyer.replyRequest(event.getRequest());
-			}
 			break;
 			
 		case REDO_TASK:	// only RT
@@ -386,13 +414,19 @@ public class TaskProcessor extends AbstractService implements EventHandler<TaskE
 			List<RTJobFlow> jobs = new LinkedList<RTJobFlow>();
 			boolean loadedAll = context.getJobStore().fetchJobs(domain, latestId,
 					jobs, engine.getLoadCapacity());
-			L.info(domain, "load " + jobs + " jobs from JobStore");
+			
+			StringBuilder b = ThreadLocalBuffer.getLogBuilder(0);
+			b.append("load [");
 			for (RTJobFlow unit : jobs) {
-				if (engine.feed(unit) == 0 && unit.isFinished()) {
-					L.info(domain, "load finished job: " + unit.getJobId());
+				b.append(unit.getJobId().toString());
+				if (engine.feed(unit) == 0 || unit.isFinished()) {
 					context.getJobStore().updateJob(domain, unit.getJobId(), RJobStat.Finished);
+					b.append("(Finished)");
 				}
+				b.append(",");
 			}
+			b.append("]");
+			L.info(domain, b.toString());
 			if (loadedAll) {
 				engine.setSync(true);
 				L.info(domain, "engine go into sync");
@@ -512,22 +546,22 @@ public class TaskProcessor extends AbstractService implements EventHandler<TaskE
 			// in case the former connection disconnected by accident, since thrift uses
 			// BIO for sync-client. TODO: replace clients with async ones
 			ZuesRPC.closeClient(client);
+			NodeId id = node.getNodeId();
+			this.assignClients.remove(id);
 			try {
-				NodeId id = node.getNodeId();
 				client = ZuesRPC.getRpcClient(TaskHandleProtocol.Iface.class, 
 					new InetSocketAddress(id.ip, id.port));
 				if (client != null) {
-					//this.assignClients.put(id, client);
+					this.assignClients.put(id, client);
 					if (assign)
 						client.assignTask(request);	
 					else
 						client.killTask(request);
 				}
 			} catch (Exception ee) {
+				this.assignClients.remove(id);
 				throw ee;
 			} 
-		} finally {
-			ZuesRPC.closeClient(client);
 		}
 		return true;
 	}

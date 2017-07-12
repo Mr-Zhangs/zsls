@@ -112,6 +112,10 @@ public class RTTask extends Task implements ResultSerializable {
 		return false;
 	}
 	
+	public int hashCode() {
+		return super.hashCode(); 
+	}
+	
 	public String toString() {
 		return this.taskId;
 	}

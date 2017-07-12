@@ -313,12 +313,14 @@ public class InnerTrackService extends CompositeService implements InnerTrackerP
 		L.warn(domain, msg);
 	}
 	
+	@SuppressWarnings("unchecked")
 	@Override
 	public HeartBeatResponse heartBeat(HeartBeatRequest request) throws TException {
 		HeartBeatResponse response = new HeartBeatResponse();
+		String domain = request.getDomain();
 		// validate node and registration info
 		NodeId id = RecordUtil.trans(request.getNodeid());
-		WorkNode node = context.getNodeManager().getNode(request.getDomain(), id);
+		WorkNode node = context.getNodeManager().getNode(domain, id);
 		if (node == null || !node.isRegistered()) {
 			setAbnormalResponse(response, NodeAction.RE_REGISTER, request.getDomain(),
 					"heartbeat from unregistered node: " + id + ", require reregister");
@@ -334,8 +336,20 @@ public class InnerTrackService extends CompositeService implements InnerTrackerP
 		nodeLiveMonitor.receivedPing(new NodeIdInfo(id, request.getDomain()));
 		response.setNodeAction(NodeAction.NORMAL);
 		if (L.logger().isDebugEnabled()) {
-			L.debug(request.getDomain(), "receive heart beat from " + id);
+			List<TTaskId> runningTasks = request.getRunningTasks();
+			StringBuilder b = ThreadLocalBuffer.getLogBuilder(0);
+			b.append("receive heart beat from ").append(id).append(" [");
+			for (TTaskId t : runningTasks) {
+				b.append(t).append(",");
+			}
+			b.append("]");
+			L.debug(request.getDomain(), b.toString());
 		}
+		// dispatch event
+		DomainType dtype = context.getDomainManager().getDomainType(domain);
+		TaskEvent event = TaskEvent.getUpdateRunningEvent(domain, dtype, node, request.getRunningTasks());
+		context.getTaskDispatcher().getEventHandler().handle(event);
+		
 		return response;
 	}
 	
@@ -359,7 +373,8 @@ public class InnerTrackService extends CompositeService implements InnerTrackerP
 			return response;
 		}
 		// do handle request
-		if (handleTaskReport(domain, request.getTaskResults(), id, "task report received"))
+		nodeLiveMonitor.receivedPing(new NodeIdInfo(id, request.getDomain()));
+		if (handleTaskReport(domain, request.getTaskResults(), request.getRunningTasks(), id, "task report received"))
 			response.setNodeAction(NodeAction.NORMAL);
 		else
 			response.setNodeAction(NodeAction.INVALID);
@@ -367,7 +382,8 @@ public class InnerTrackService extends CompositeService implements InnerTrackerP
 	}
 	
 	@SuppressWarnings("unchecked")
-	private boolean handleTaskReport(String domain, List<TTaskResult> results, NodeId id, String msg) {
+	private boolean handleTaskReport(String domain, List<TTaskResult> results, List<TTaskId> runningTasks,
+			NodeId id, String msg) {
 		List<TaskResult> list = new ArrayList<TaskResult>();
 		StringBuilder builder = ThreadLocalBuffer.getLogBuilder(0);
 		builder.append(msg).append(", finished tasks -> ");
@@ -414,7 +430,7 @@ public class InnerTrackService extends CompositeService implements InnerTrackerP
 							L.error(domain, errMsg);
 					}
 					// dispatch events
-					TaskEvent event = TaskEvent.getTaskResponseEvent(domain, dtype, r);
+					TaskEvent event = TaskEvent.getTaskResponseEvent(domain, dtype, r, runningTasks);
 					context.getTaskDispatcher().getEventHandler().handle(event);
 					break;
 					

@@ -1,5 +1,6 @@
 package org.pbccrc.zsls.front.request;
 
+import java.util.ArrayList;
 import java.util.List;
 
 import org.pbccrc.zsls.JobTracker.DomainStatus;
@@ -7,6 +8,7 @@ import org.pbccrc.zsls.api.client.IJobFlow;
 import org.pbccrc.zsls.api.client.old.IScheduleUnit;
 import org.pbccrc.zsls.api.client.old.UnitValidator;
 import org.pbccrc.zsls.api.quartz.QuartzTrigger;
+import org.pbccrc.zsls.api.thrift.records.TTaskId;
 import org.pbccrc.zsls.config.Configuration;
 import org.pbccrc.zsls.config.ZslsConstants;
 import org.pbccrc.zsls.context.AppContext;
@@ -265,18 +267,21 @@ public class RequestManager extends CompositeService implements
 		String msg = null;
 		if (dtype == JobType.RT && taskId != null) {
 			Task task = LocalJobManager.getRTJobManager(domain).getTask(taskId);
-			if (task != null && task.getStatus() != TaskStat.Finished) {
+			TaskStat stat = task != null ? task.getStatus() : null;
+			if (stat == TaskStat.Fail) {
 				boolean ret = context.getJobStore().updateTask(domain, new TaskId(taskId), TaskStat.Finished, null);
 				if (ret) {
-					TaskEvent event = TaskEvent.getTaskResponseEvent(domain, DomainType.RT, TaskResult.fakeCompleteTaskResult(taskId));
+					TaskEvent event = TaskEvent.getTaskResponseEvent(domain, DomainType.RT, 
+							TaskResult.fakeCompleteTaskResult(taskId), new ArrayList<TTaskId>());
 					event.setRequest(request);
 					context.getTaskDispatcher().getEventHandler().handle(event);
+					Replyer.replyRequest(request);
 					return;
 				} else {
 					msg = "failed to mark task " + taskId + " in job store";
 				}
 			} else {
-				msg = "invalid id or status for task " + taskId;
+				msg = "invalid id or status for task " + taskId + ", status: " + stat;
 			}
 		} else {
 			msg = "invalid job type or task id";
@@ -427,7 +432,7 @@ public class RequestManager extends CompositeService implements
 				if (userRequest.jobType == JobType.DT)
 					result = queryHelper.queryUnits();
 				else
-					result = queryHelper.queryUnitByDate(userRequest.getDomain(), userRequest.getTime());
+					result = queryHelper.queryUnitByDate(userRequest.getDomain(), userRequest.getTime(), userRequest.getStart(), userRequest.getEnd());
 				break;
 			case Unit:
 				if (userRequest.jobType == JobType.DT)

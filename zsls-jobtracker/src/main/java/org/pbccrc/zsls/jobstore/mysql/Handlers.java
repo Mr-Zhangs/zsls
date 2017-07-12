@@ -17,6 +17,7 @@ import org.pbccrc.zsls.api.quartz.CronQuartzTrigger;
 import org.pbccrc.zsls.api.quartz.QuartzTrigger;
 import org.pbccrc.zsls.api.quartz.QuartzTrigger.TriggerType;
 import org.pbccrc.zsls.api.quartz.SimpleQuartzTrigger;
+import org.pbccrc.zsls.jobengine.Task.ExecuteResult;
 import org.pbccrc.zsls.jobengine.Task.TaskStat;
 import org.pbccrc.zsls.jobstore.JdbcJobStore;
 import org.pbccrc.zsls.store.jdbc.utils.ResultSetHandler;
@@ -24,6 +25,7 @@ import org.pbccrc.zsls.tasks.dt.ServerQuartzJob;
 import org.pbccrc.zsls.tasks.dt.ServerQuartzJob.QJobStat;
 import org.pbccrc.zsls.tasks.rt.RTJobFlow;
 import org.pbccrc.zsls.tasks.rt.RTJobFlow.RJobStat;
+import org.pbccrc.zsls.tasks.rt.RTJobId;
 import org.pbccrc.zsls.tasks.rt.RTTask;
 import org.pbccrc.zsls.utils.JsonSerilizer;
 import org.pbccrc.zsls.utils.TaskUtil;
@@ -72,8 +74,10 @@ public class Handlers {
 			while (rs.next()) {
 				String taskId = rs.getString(JdbcJobStore.COL_QT_ID);
 				SimpleTaskInfo task = new SimpleTaskInfo();
-				task.statValue =  (int)rs.getLong(JdbcJobStore.COL_QT_STAT);;
-				task.keymessage = rs.getString(JdbcJobStore.COL_QT_RESULT);
+				task.statValue =  (int)rs.getLong(JdbcJobStore.COL_QT_STAT);
+				ExecuteResult er = JsonSerilizer.deserilize(rs.getString(JdbcJobStore.COL_QT_RESULT), ExecuteResult.class);
+				task.feedback = er.feedback;
+				task.keymessage = er.keymessage;
 				result.put(taskId, task);
 			}
 			return result;
@@ -130,12 +134,18 @@ public class Handlers {
 			List<RTJobFlow> sList = new LinkedList<RTJobFlow>();
 			while (rs.next()) {
 				long id = rs.getLong(JdbcJobStore.COL_UNIT_ID);
-				IScheduleUnit iS = JsonSerilizer.deserilize(rs.getString(JdbcJobStore.COL_UNIT_CONTENT), IScheduleUnit.class);
-				RTJobFlow unit = TaskUtil.parseJobUnit(iS);
+				//IScheduleUnit iS = JsonSerilizer.deserilize(rs.getString(JdbcJobStore.COL_UNIT_CONTENT), IScheduleUnit.class);
+				//RTJobFlow unit = TaskUtil.parseJobUnit(iS);
+				RTJobFlow unit = new RTJobFlow();
+				Date date = rs.getDate(JdbcJobStore.COL_UNIT_CTIME);
+				unit.setUnitId(id);
+				unit.setGenerateTime(date);
+				long preUnitId = rs.getLong(JdbcJobStore.COL_UNIT_PREUNIT);
+				unit.setPreUnit(preUnitId > 0 ? new RTJobId(preUnitId) : null);
 				int stat = rs.getInt(JdbcJobStore.COL_UNIT_STATUS);
 				if (stat == RJobStat.Finished.getVal())
 					unit.markJobFinish(true);
-				unit.updateUnitIdForAllTasks(id);
+				//unit.updateUnitIdForAllTasks(id);
 				sList.add(unit);
 			}
 			return sList;
@@ -151,7 +161,10 @@ public class Handlers {
 				TaskStat stat = TaskStat.getInstance(rs.getInt(JdbcJobStore.COL_TASK_STATUS));
 				RTTask task = new RTTask(taskId, null);
 				task.markStatus(stat);
-				task.updateExecuteResult(null, rs.getString(JdbcJobStore.COL_TASK_FEEDBACK));
+				String info = rs.getString(JdbcJobStore.COL_TASK_INFO);
+				ExecuteResult rt = JsonSerilizer.deserilize(info, ExecuteResult.class);
+				if (rt != null)
+					task.updateExecuteResult(rt.keymessage, rt.feedback);
 				uList.put(taskId, task);
 			}
 			return uList;
